@@ -84,18 +84,17 @@ class RedisStorage(Storage):
         return False
 
     def get(self, key: str) -> Any:
-        if key not in self.store:
-            return None
         if self._is_expired(key):
             return None
-        return self.store[key]
+        return self.store.get(key, None)
 
     def set(self, key: str, value: Any) -> None:
+        self._is_expired(key)
         self.store[key] = value
 
     def increment(self, key: str, amount: int = 1) -> int:
         if self._is_expired(key):
-            self.store[key] = 0
+            self.store.pop(key, None)
         value = self.store.get(key, 0)
         if not isinstance(value, int):
             raise ValueError("Value is not an integer")
@@ -107,33 +106,33 @@ class RedisStorage(Storage):
         self.expiry[key] = time.time() + ttl
 
     def add_to_sorted_set(self, key: str, score: float, value: Any) -> None:
-        if self._is_expired(key):
-            self.sorted_sets[key] = []
+        self._is_expired(key)
         if key not in self.sorted_sets:
             self.sorted_sets[key] = []
-
-        self.sorted_sets[key].append((score,value))
-        self.sorted_sets[key].sort(key = lambda x: x[0])
+        self.sorted_sets[key].append((score, value))
+        self.sorted_sets[key].sort(key=lambda x: x[0])
 
     def get_sorted_range(self, key:str, start:float, end:float) -> List[Any]:
-        if key not in self.sorted_sets:
-            return []
         if self._is_expired(key):
             return []
-        
-        result = []
-        for score, value in self.sorted_sets[key]:
-            if start <= score <= end:
-                result.append(value)
-        return result
+        if key not in self.sorted_sets:
+            return []
+        return [
+            value
+            for score, value in self.sorted_sets[key]
+            if start <= score <= end
+        ]
     
     def remove_expired(self, key: str, threshold: float) -> None:
-        if key not in self.sorted_sets:
-            return
         if self._is_expired(key):
             return
-
-        self.sorted_sets[key] = [(score,value) for score, value in self.sorted_sets[key] if score >= threshold]
+        if key not in self.sorted_sets:
+            return
+        self.sorted_sets[key] = [
+            (score, value)
+            for score, value in self.sorted_sets[key]
+            if score >= threshold
+        ]
 
 class RateLimitStrategy(ABC):
     def __init__(self, storage: Storage):
@@ -231,5 +230,140 @@ class LeakyBucketStrategy(RateLimitStrategy):
             "X-RateLimit-Retry-After": round(retry_after, 2)
         }
     
+        return RateLimitResponse(allowed=allowed, headers=headers)
+
+class FixedWindowStrategy(RateLimitStrategy):
+    def allow_request(self,key: str, rule: RateLimitRule, current_time: float) -> RateLimitResponse:
+        bucket = self.storage.get(key)
+        if bucket is None:
+            bucket = {
+                "count": 0,
+                "window_start": current_time
+            }
+        count = bucket["count"]
+        window_start = bucket["window_start"]
+
+        if current_time - window_start >= rule.window:
+            count = 0
+            window_start = current_time
+
+        if count < rule.limit:
+            allowed = True
+            count += 1
+        else:
+            allowed = False
+
+        updated_bucket = {
+            "count": count,
+            "window_start": window_start
+        }
+
+        self.storage.set(key, updated_bucket)
+        self.storage.set_expiry(key, rule.window * 2)
+
+        if not allowed:
+            retry_after = rule.window - (current_time - window_start)
+        else:
+            retry_after = 0
+
+        remaining = max(0, rule.limit - count)
+
+        headers = {
+            "X-RateLimit-Limit": rule.limit,
+            "X-RateLimit-Remaining": remaining,
+            "X-RateLimit-Retry-After": round(retry_after, 2)
+        }
+
+        return RateLimitResponse(allowed=allowed, headers=headers)
+
+class SlidingWindowLogStrategy(RateLimitStrategy):
+    def allow_request(self,key: str, rule: RateLimitRule, current_time: float) -> RateLimitResponse:
+        window_start = current_time - rule.window
+        self.storage.remove_expired(key, window_start)
+
+        timestamps = self.storage.get_sorted_range(
+            key,
+            window_start,
+            current_time
+        )
+
+        current_count = len(timestamps)
+
+        if current_count < rule.limit:
+            allowed = True
+            self.storage.add_to_sorted_set(key, current_time, current_time)
+        else:
+            allowed = False
+
+        self.storage.set_expiry(key, rule.window * 2)
+
+        if not allowed and timestamps:
+            oldest = timestamps[0]
+            retry_after = rule.window - (current_time - oldest)
+        else:
+            retry_after = 0
+
+        remaining = max(0, rule.limit - current_count)
+
+        headers = {
+            "X-RateLimit-Limit": rule.limit,
+            "X-RateLimit-Remaining": remaining,
+            "X-RateLimit-Retry-After": round(retry_after, 2)
+        }
+
+        return RateLimitResponse(allowed=allowed, headers=headers)
+
+class SlidingWindowCounterStrategy(RateLimitStrategy):
+    def allow_request(self,key: str, rule: RateLimitRule, current_time: float) -> RateLimitResponse:
+        bucket = self.storage.get(key)
+        if bucket is None:
+            bucket = {
+                "current_count": 0,
+                "previous_count": 0,
+                "current_window_start": current_time
+            }
+
+        current_count = bucket["current_count"]
+        previous_count = bucket["previous_count"]
+        current_window_start = bucket["current_window_start"]
+
+        if current_time - current_window_start >= rule.window:
+            previous_count = current_count
+            current_count = 0
+            current_window_start = current_time
+
+        elapsed = current_time - current_window_start
+        weight = elapsed / rule.window
+
+        effective_count = current_count + (previous_count * (1 - weight))
+
+        if effective_count < rule.limit:
+            allowed = True
+            current_count += 1
+        else:
+            allowed = False
+
+        updated_bucket = {
+            "current_count": current_count,
+            "previous_count": previous_count,
+            "current_window_start": current_window_start
+        }
+
+        self.storage.set(key, updated_bucket)
+        self.storage.set_expiry(key, window_size * 2)
+
+        if not allowed:
+            retry_after = window_size - elapsed
+        else:
+            retry_after = 0
+
+        remaining = max(0, int(rule.limit - effective_count))
+
+        headers = {
+            "X-RateLimit-Limit": rule.limit,
+            "X-RateLimit-Remaining": remaining,
+            "X-RateLimit-Retry-After": round(retry_after, 2)
+        }
+
         return RateLimitResponse(allowed=allowed, headers=headers)
 
