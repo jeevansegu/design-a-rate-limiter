@@ -16,7 +16,7 @@ func NewServer(addr string) *http.Server {
 
 	store := redisstore.New()
 
-	limiter := ratelimiter.NewRedisFixedWindow(store, 10, time.Minute)
+	limiter := ratelimiter.NewRedisSlidingWindow(store, 10, time.Minute)
 	return &http.Server{
 		Addr:    addr,
 		Handler: middleware.MainMiddleware(limiter, mux),

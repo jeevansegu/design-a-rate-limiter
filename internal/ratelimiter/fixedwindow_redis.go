@@ -10,11 +10,11 @@ import (
 
 type RedisFixedWindow struct {
 	store  *redisstore.Client
-	limit  int
+	limit  int64
 	window time.Duration
 }
 
-func NewRedisFixedWindow(store *redisstore.Client, limit int, window time.Duration) *RedisFixedWindow {
+func NewRedisFixedWindow(store *redisstore.Client, limit int64, window time.Duration) *RedisFixedWindow {
 	return &RedisFixedWindow{
 		store:  store,
 		limit:  limit,
@@ -37,7 +37,7 @@ func (fw *RedisFixedWindow) Allow(key string, ctx context.Context) bool {
 		}
 	}
 
-	if count > int64(fw.limit) {
+	if count > fw.limit {
 		return false
 	}
 	return true
