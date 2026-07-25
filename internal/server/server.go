@@ -15,9 +15,9 @@ func NewServer(addr string) *http.Server {
 
 	store := redisstore.New()
 
-	limiter := ratelimiter.NewRedisTokenBucket(store, 10, 1)
+	limiter := ratelimiter.NewRedisLeakyBucket(store, 10, 1)
 	return &http.Server{
-		Addr: addr,
+		Addr:    addr,
 		Handler: middleware.MainMiddleware(limiter, mux),
 	}
 }

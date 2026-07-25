@@ -22,9 +22,9 @@ func New() *Client {
 	pass := os.Getenv("REDIS_PASS")
 
 	rdb := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
+		Addr:     "localhost:6379",
 		Password: pass,
-		DB: 0,
+		DB:       0,
 	})
 
 	if err := rdb.Ping(context.Background()).Err(); err != nil {
